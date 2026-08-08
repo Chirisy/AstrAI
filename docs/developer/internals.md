@@ -178,10 +178,11 @@ Three-layer separation (SGLang-inspired):
 
 Attention computation is decoupled from the model via `AttentionBackend` ABC (`astrai/extension/attention_backend.py`):
 
-- **`CudaBackend`** (default): decode path uses `attn_paged_decode` with `page_size=1` (the `req_to_token` table serves as the page table, each token slot is a single-token "page"); prefill path uses the ragged-batch `attn_paged_prefill` (addresses each request via `qo_indptr` + `kv_indptr` directly against the flat pool). Falls back to `FlashAttnBackend` when dtype unsupported.
+- **`CudaBackend`** (default): decode path uses `attn_paged_decode` with `page_size=1` (the `req_to_token` table serves as the page table, each token slot is a single-token "page"); prefill path uses the ragged-batch `attn_paged_prefill` (addresses each request via `qo_indptr` + `kv_indptr` directly against the flat pool). Falls back to `FlashInferBackend` or `FlashAttnBackend` when dtype/head_dim unsupported.
+- **`FlashInferBackend`**: optional FlashInfer paged-KV dispatch with `BatchDecodeWithPagedKVCacheWrapper` and `BatchPrefillWithPagedKVCacheWrapper`; uses the flat KV pool as `page_size=1` pages.
 - **`FlashAttnBackend`**: optional flash-attn dispatch with `flash_attn_with_kvcache` fast path for contiguous cache; falls back to KV gather + `flash_attn_func`.
 - **`TorchNativeBackend`** (always-available fallback): writes K/V to cache, gathers via `req_to_token` indirect indexing, calls `F.scaled_dot_product_attention`.
-- Default priority: cuda > flash > torch. Set `ASTR_BACKEND=cuda|torch_native|flash` to override.
+- Default priority: cuda > flashinfer > flash > torch. Set `ASTR_BACKEND=cuda|flashinfer|flash|torch_native` to override.
 
 Rotary embedding is applied via `apply_rotary_emb` in `astrai/extension/rotary_backend.py`, which auto-dispatches to the fused CUDA kernel (`rotary_emb.cu`) during inference or torch complex multiply during training (for autograd compatibility). Both attention backends share the same rotary dispatch.
 

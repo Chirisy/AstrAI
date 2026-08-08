@@ -36,7 +36,7 @@ pip install -e .
 # pip install -e ".[dev]"
 ```
 
-> **CUDA kernels** are opt-in at build time (`CSRC_KERNELS=true`). Once built, `CudaBackend` is the default attention backend on GPU (cuda > flash > torch priority). Override via `ASTR_BACKEND` env var or `attn_backend()` context manager. Fused rotary embedding kernel is auto-dispatched when available. Skip for CPU-only usage.
+> **CUDA kernels** are opt-in at build time (`CSRC_KERNELS=true`). Once built, `CudaBackend` is the default attention backend on GPU (cuda > flashinfer > flash > torch priority). Override via `ASTR_BACKEND` env var or `attn_backend()` context manager. Fused rotary embedding kernel is auto-dispatched when available. Skip for CPU-only usage.
 
 ## 2. Download Model Weights
 

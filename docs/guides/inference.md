@@ -66,11 +66,12 @@ Attention computation (cache I/O + SDPA/kernel dispatch) is decoupled from the m
 ```
 AttentionBackend (ABC)
   ├── CudaBackend          CUDA kernel dispatch (default on GPU)
+  ├── FlashInferBackend    Optional FlashInfer paged-KV dispatch (fallback)
   ├── FlashAttnBackend     Optional flash-attn dispatch (fallback)
   └── TorchNativeBackend   SDPA + indirect KV cache gather (always-available fallback)
 ```
 
-Default priority: cuda > flash > torch.  Set ``ASTR_BACKEND=cuda|torch_native|flash``
+Default priority: cuda > flashinfer > flash > torch.  Set ``ASTR_BACKEND=cuda|flashinfer|flash|torch_native``
 to override.
 
 Select via context manager (mirrors `torch.nn.attention.sdpa_kernel`):
@@ -86,7 +87,7 @@ with attn_backend(ATTN_BACKEND.CUDA):
 
 `CudaBackend` prefill path: writes K/V, then calls `attn_paged_prefill` — a ragged-batch (paged) prefill kernel that reads K/V directly from the flat pool via `req_to_token`, addressing each request's `q_len`/`kv_len` through `qo_indptr` and `kv_indptr`. No explicit K/V gather needed.
 
-Fallback: when `CudaBackend` cannot handle an input (wrong dtype or head_dim), `FlashAttnBackend` is tried next (if installed), then `TorchNativeBackend`.
+Fallback: when `CudaBackend` cannot handle an input (wrong dtype or head_dim), `FlashInferBackend` is tried next (if installed and compatible), then `FlashAttnBackend`, then `TorchNativeBackend`.
 
 ### Rotary Embedding Backend
 

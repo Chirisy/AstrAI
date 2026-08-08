@@ -10,22 +10,25 @@ from astrai.extension import (
     ATTN_BACKEND,
     AttentionBackendFactory,
     CudaBackend,
+    FlashInferBackend,
     attn_backend,
     get_backend,
 )
 
 
 def test_default_backend_resolves_to_available():
-    """Default backend is the first available in cuda > flash > torch order."""
+    """Default backend is the first available in cuda > flashinfer > flash > torch order."""
     from astrai.extension.attention_backend import (
         CudaBackend,
         FlashAttnBackend,
+        FlashInferBackend,
         TorchNativeBackend,
-        _resolve_default_backend,
     )
 
     backend = get_backend()
-    assert isinstance(backend, (CudaBackend, FlashAttnBackend, TorchNativeBackend))
+    assert isinstance(
+        backend, (CudaBackend, FlashInferBackend, FlashAttnBackend, TorchNativeBackend)
+    )
 
 
 def test_attn_backend_context_with_enum():
@@ -42,10 +45,18 @@ def test_attn_backend_context_with_registered_name():
     assert get_backend() is default
 
 
+def test_attn_backend_context_with_flashinfer_enum():
+    default = get_backend()
+    with attn_backend(ATTN_BACKEND.FLASHINFER):
+        assert isinstance(get_backend(), FlashInferBackend)
+    assert get_backend() is default
+
+
 def test_attention_backend_factory_lists_builtin_backends():
     assert AttentionBackendFactory.list_registered() == [
         "cuda",
         "flash",
+        "flashinfer",
         "torch_native",
     ]
 

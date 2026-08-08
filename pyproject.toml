@@ -33,6 +33,7 @@ urls = { Homepage = "https://github.com/ViperEkura/AstrAI" }
 [project.optional-dependencies]
 dev = ["pytest==9.0.2", "ruff", "httpx2"]
 flash = ["flash-attn>=2.6"]
+flashinfer = ["flashinfer-python>=0.5.3"]
 
 [tool.setuptools.packages.find]
 where = ["."]

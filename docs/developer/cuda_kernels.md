@@ -87,10 +87,11 @@ Each kernel in `astrai/extension/lib` is compiled as an independent pybind11 mod
 
 - **`AttentionBackend`** (ABC): `fwd_decode` / `fwd_prefill` abstract methods, `forward` dispatches by q_len
 - **`CudaBackend`**: CUDA kernel dispatch — decode via `attn_paged_decode` (page_size=1), prefill via `attn_paged_prefill` (ragged batch, `qo_indptr` + `kv_indptr`). Default on GPU.
+- **`FlashInferBackend`**: Optional FlashInfer paged-KV dispatch with decode and prefill wrappers.
 - **`FlashAttnBackend`**: Optional flash-attn dispatch with `flash_attn_with_kvcache` fast path.
 - **`TorchNativeBackend`**: SDPA with indirect KV cache gather (always-available fallback)
 
-Default priority: cuda > flash > torch. Set ``ASTR_BACKEND=cuda|torch_native|flash``
+Default priority: cuda > flashinfer > flash > torch. Set ``ASTR_BACKEND=cuda|flashinfer|flash|torch_native``
 to override the default.
 
 Select a backend via context manager (mirrors `torch.nn.attention.sdpa_kernel`):
@@ -102,7 +103,7 @@ with attn_backend(ATTN_BACKEND.CUDA):
     engine.generate("hello")
 ```
 
-`CudaBackend` falls back to `FlashAttnBackend` (when flash-attn is installed and supports the input dtype) or `TorchNativeBackend` otherwise.
+`CudaBackend` falls back to `FlashInferBackend` (when FlashInfer is installed and supports the input) or `FlashAttnBackend` (when flash-attn supports the input), then `TorchNativeBackend` otherwise.
 
 ### Rotary Backend
 

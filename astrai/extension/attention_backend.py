@@ -22,7 +22,7 @@ Usage — mirroring ``torch.nn.attention.sdpa_kernel``:
 
 Thread-safe via ``contextvars`` — each scheduler thread gets its own
 active backend. ``get_backend()`` returns the active one, falling back
-to a process-wide default (cuda > flash > torch, overridable via
+to a process-wide default (cuda > flashinfer > flash > torch, overridable via
 ``ASTR_BACKEND``).
 
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
@@ -37,7 +37,7 @@ import os
 import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -93,11 +93,36 @@ def _get_flash_attn():
         return None
 
 
+@functools.lru_cache(maxsize=1)
+def flashinfer_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    fi = _get_flashinfer()
+    if fi is None:
+        return False
+    return all(
+        hasattr(fi, name)
+        for name in (
+            "BatchDecodeWithPagedKVCacheWrapper",
+            "BatchPrefillWithPagedKVCacheWrapper",
+        )
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _get_flashinfer():
+    try:
+        return importlib.import_module("flashinfer")
+    except Exception:
+        return None
+
+
 class ATTN_BACKEND(enum.Enum):
     """Backend selector enum, mirroring ``torch.nn.attention.SDPBackend``."""
 
     TORCH_NATIVE = "torch_native"
     CUDA = "cuda"
+    FLASHINFER = "flashinfer"
     FLASH = "flash"
 
 
@@ -106,10 +131,12 @@ _default_backend_lock = threading.Lock()
 
 
 def _priority_backends() -> list["AttentionBackend"]:
-    """Available backends in priority order: cuda -> flash -> torch."""
+    """Available backends in priority order: cuda -> flashinfer -> flash -> torch."""
     backends: list[AttentionBackend] = []
     if is_available("attn_paged_decode") and is_available("attn_paged_prefill"):
         backends.append(CudaBackend())
+    if flashinfer_available():
+        backends.append(FlashInferBackend())
     if flash_attn_available():
         backends.append(FlashAttnBackend())
     backends.append(TorchNativeBackend())
@@ -119,6 +146,7 @@ def _priority_backends() -> list["AttentionBackend"]:
 def _backend_supports(
     backend: "AttentionBackend",
     q: Tensor,
+    k: Tensor,
     kv_cache: Optional["KVCache"],
     attn_mask: Optional[Tensor],
     is_causal: bool,
@@ -134,6 +162,21 @@ def _backend_supports(
             and q.dtype == torch.bfloat16
             and q.size(-1) in (32, 64, 128, 256)
         )
+    if isinstance(backend, FlashInferBackend):
+        if not flashinfer_available() or kv_cache is None:
+            return False
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if q.size(-1) != k.size(-1) or q.size(2) % k.size(2) != 0:
+            return False
+        if kv_cache.kv_indptr is None:
+            return False
+        if q.size(1) > 1:
+            if kv_cache.qo_indptr is None:
+                return False
+            if attn_mask is not None and attn_mask.dim() not in (2, 3, 4):
+                return False
+        return True
     if isinstance(backend, FlashAttnBackend):
         if not flash_attn_available():
             return False
@@ -146,10 +189,10 @@ def _backend_supports(
 
 
 def _resolve_default_backend() -> "AttentionBackend":
-    """Pick the highest-priority available backend (cuda -> flash -> torch).
+    """Pick the highest-priority available backend (cuda -> flashinfer -> flash -> torch).
 
     Set ``ASTR_BACKEND`` to override: ``ASTR_BACKEND=cuda``, ``torch_native``,
-    or ``flash``.  The value is the registered name (same as the
+    ``flashinfer``, or ``flash``.  The value is the registered name (same as the
     ``ATTN_BACKEND`` enum value).
 
     Resolved lazily on first ``get_backend()`` and cached.  Per-call
@@ -168,8 +211,8 @@ def _resolve_default_backend() -> "AttentionBackend":
 def get_backend() -> "AttentionBackend":
     """Return the active backend for the current thread/context.
 
-    Falls back to the highest-priority available backend (cuda -> flash ->
-    torch_native) when no backend has been activated via ``with``.  Set
+    Falls back to the highest-priority available backend (cuda -> flashinfer ->
+    flash -> torch_native) when no backend has been activated via ``with``.  Set
     ``ASTR_BACKEND`` to override the default.
     """
     try:
@@ -282,7 +325,7 @@ def attention(
         [batch, q_len, n_heads * head_dim]
     """
     backend = get_backend()
-    if not _backend_supports(backend, q, kv_cache, attn_mask, is_causal):
+    if not _backend_supports(backend, q, k, kv_cache, attn_mask, is_causal):
         try:
             explicit = _current_backend.get()
         except LookupError:
@@ -298,7 +341,7 @@ def attention(
         for candidate in _priority_backends():
             if isinstance(candidate, type(backend)):
                 continue
-            if _backend_supports(candidate, q, kv_cache, attn_mask, is_causal):
+            if _backend_supports(candidate, q, k, kv_cache, attn_mask, is_causal):
                 backend = candidate
                 break
     return backend.forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
@@ -577,6 +620,387 @@ class CudaBackend(AttentionBackend):
             is_causal=is_causal,
         )
         return out.reshape(b, q_len, q.size(2), q.size(3)).flatten(2)
+
+
+@AttentionBackendFactory.register(ATTN_BACKEND.FLASHINFER.value)
+class FlashInferBackend(AttentionBackend):
+    """FlashInfer backend using paged KV wrappers.
+
+    The project KV pool is token-addressed, so it is exposed to FlashInfer
+    as a paged cache with ``page_size=1``. New K/V values are written to the
+    existing flat cache buffers, and FlashInfer receives the per-request
+    indptr plus flattened physical token indices from ``req_to_token``.
+    """
+
+    _PAGE_SIZE = 1
+
+    def __init__(self, workspace_size: int = 128 * 1024 * 1024):
+        self.workspace_size = workspace_size
+        self.float_workspace_buffer: Optional[Tensor] = None
+        self.prefill_wrapper: Any = None
+        self.decode_wrapper: Any = None
+        self._device: Optional[torch.device] = None
+        self._use_tensor_cores: Optional[bool] = None
+        self._ones_cpu = torch.empty(0, dtype=torch.int32)
+        self._last_decode_cache: Optional["KVCache"] = None
+        self._last_decode_signature: Optional[tuple] = None
+        self._last_decode_tensors: tuple[Tensor, ...] = ()
+        self._last_prefill_cache: Optional["KVCache"] = None
+        self._last_prefill_signature: Optional[tuple] = None
+        self._last_prefill_tensors: tuple[Tensor, ...] = ()
+
+    @staticmethod
+    def supports(**kwargs) -> bool:
+        head_dim = kwargs.get("head_dim")
+        if head_dim is not None and head_dim <= 0:
+            return False
+        return flashinfer_available()
+
+    def fwd_decode(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        kv_cache: Optional["KVCache"],
+        layer_id: int,
+        attn_mask: Optional[Tensor] = None,
+        is_causal: bool = False,
+    ) -> Tensor:
+        if kv_cache is None:
+            raise RuntimeError(
+                "FlashInferBackend does not support training (kv_cache=None)"
+            )
+        self._ensure_initialized(q.device, self._should_use_tensor_cores(q, k))
+        self._write_decode_kv(kv_cache, k, v, layer_id)
+        self._plan_decode(q, k, kv_cache)
+
+        assert self.decode_wrapper is not None
+        out = self._run_wrapper(
+            self.decode_wrapper,
+            q.squeeze(1).contiguous(),
+            self._paged_kv_cache(kv_cache, layer_id),
+        )
+        out = self._unwrap_flashinfer_output(out)
+        return out.unsqueeze(1).contiguous().flatten(2)
+
+    def fwd_prefill(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        kv_cache: Optional["KVCache"],
+        layer_id: int,
+        attn_mask: Optional[Tensor] = None,
+        is_causal: bool = False,
+    ) -> Tensor:
+        if kv_cache is None:
+            raise RuntimeError(
+                "FlashInferBackend does not support training (kv_cache=None)"
+            )
+        if kv_cache.qo_indptr is None:
+            raise RuntimeError("FlashInferBackend requires qo_indptr for prefill")
+
+        self._ensure_initialized(q.device, self._should_use_tensor_cores(q, k))
+        self._write_prefill_kv(kv_cache, k, v, layer_id)
+        q_lens = self._indptr_lens(kv_cache.qo_indptr)
+        self._plan_prefill(q, k, kv_cache, attn_mask, is_causal, q_lens)
+
+        assert self.prefill_wrapper is not None
+        q_flat = self._flatten_prefill_q(q, q_lens)
+        out = self._run_wrapper(
+            self.prefill_wrapper,
+            q_flat.contiguous(),
+            self._paged_kv_cache(kv_cache, layer_id),
+        )
+        out = self._unwrap_flashinfer_output(out)
+        out = self._restore_prefill_output(out, q, q_lens)
+        return out.contiguous().flatten(2)
+
+    def _ensure_initialized(self, device: torch.device, use_tensor_cores: bool) -> None:
+        device = torch.device(device)
+        if self.float_workspace_buffer is not None:
+            if self._device != device:
+                raise RuntimeError(
+                    "FlashInferBackend cannot move devices after initialization"
+                )
+            return
+
+        fi = _get_flashinfer()
+        if fi is None:
+            raise RuntimeError(
+                "FlashInferBackend requires the optional flashinfer-python package. "
+                "Install it with `pip install flashinfer-python`."
+            )
+
+        self._device = device
+        self._use_tensor_cores = use_tensor_cores
+        self.float_workspace_buffer = torch.zeros(
+            self.workspace_size, dtype=torch.uint8, device=device
+        )
+        self.prefill_wrapper = fi.BatchPrefillWithPagedKVCacheWrapper(
+            self.float_workspace_buffer,
+            kv_layout="NHD",
+            backend="fa2",
+        )
+        self.decode_wrapper = fi.BatchDecodeWithPagedKVCacheWrapper(
+            self.float_workspace_buffer,
+            use_tensor_cores=use_tensor_cores,
+            kv_layout="NHD",
+            backend="fa2",
+        )
+
+        int_workspace = getattr(self.prefill_wrapper, "_int_workspace_buffer", None)
+        if int_workspace is not None and hasattr(
+            self.decode_wrapper, "_int_workspace_buffer"
+        ):
+            self.decode_wrapper._int_workspace_buffer = int_workspace
+
+    @staticmethod
+    def _should_use_tensor_cores(q: Tensor, k: Tensor) -> bool:
+        return q.size(2) // k.size(2) >= 4
+
+    @staticmethod
+    def _as_int32(tensor: Tensor) -> Tensor:
+        if tensor.dtype == torch.int32:
+            return tensor
+        return tensor.to(torch.int32)
+
+    def _get_ones_cpu(self, batch: int) -> Tensor:
+        if batch <= self._ones_cpu.numel():
+            return self._ones_cpu[:batch]
+        size = 1 << (batch - 1).bit_length()
+        try:
+            self._ones_cpu = torch.ones(size, dtype=torch.int32, pin_memory=True)
+        except RuntimeError:
+            self._ones_cpu = torch.ones(size, dtype=torch.int32)
+        return self._ones_cpu[:batch]
+
+    @staticmethod
+    def _unwrap_flashinfer_output(out):
+        if isinstance(out, tuple):
+            return out[0]
+        return out
+
+    @staticmethod
+    def _run_wrapper(wrapper, q: Tensor, paged_kv_cache: tuple[Tensor, Tensor]):
+        try:
+            return wrapper.run(q=q, paged_kv_cache=paged_kv_cache, return_lse=False)
+        except TypeError as exc:
+            if "return_lse" not in str(exc):
+                raise
+            return wrapper.run(q=q, paged_kv_cache=paged_kv_cache)
+
+    @staticmethod
+    def _write_decode_kv(
+        kv_cache: "KVCache", k: Tensor, v: Tensor, layer_id: int
+    ) -> None:
+        loc = kv_cache.out_cache_loc[:, 0]
+        kv_cache.k_buffer[layer_id].index_copy_(0, loc, k[:, 0])
+        kv_cache.v_buffer[layer_id].index_copy_(0, loc, v[:, 0])
+
+    @staticmethod
+    def _write_prefill_kv(
+        kv_cache: "KVCache", k: Tensor, v: Tensor, layer_id: int
+    ) -> None:
+        loc = kv_cache.out_cache_loc.reshape(-1)
+        kv_cache.k_buffer[layer_id].index_copy_(
+            0, loc, k.reshape(-1, k.size(2), k.size(3))
+        )
+        kv_cache.v_buffer[layer_id].index_copy_(
+            0, loc, v.reshape(-1, v.size(2), v.size(3))
+        )
+
+    @staticmethod
+    def _paged_kv_cache(kv_cache: "KVCache", layer_id: int) -> tuple[Tensor, Tensor]:
+        n_kv = kv_cache.k_buffer.size(2)
+        head_dim = kv_cache.k_buffer.size(3)
+        return (
+            kv_cache.k_buffer[layer_id].view(-1, 1, n_kv, head_dim),
+            kv_cache.v_buffer[layer_id].view(-1, 1, n_kv, head_dim),
+        )
+
+    def _paged_indices(self, kv_cache: "KVCache") -> Tensor:
+        rows = kv_cache.req_to_token[kv_cache.req_pool_indices, : kv_cache.max_len]
+        mask = (
+            torch.arange(kv_cache.max_len, device=rows.device)[None, :]
+            < kv_cache.seq_lens[:, None]
+        )
+        return rows[mask].to(torch.int32)
+
+    @staticmethod
+    def _indptr_lens(indptr: Tensor) -> list[int]:
+        values = indptr.detach().to("cpu").tolist()
+        return [int(values[i + 1] - values[i]) for i in range(len(values) - 1)]
+
+    def _flatten_custom_mask(
+        self, attn_mask: Tensor, q: Tensor, kv_cache: "KVCache", q_lens: list[int]
+    ) -> Tensor:
+        mask = attn_mask
+        if mask.device != q.device:
+            mask = mask.to(q.device)
+        if mask.dtype != torch.bool:
+            mask = mask.to(torch.bool)
+        if mask.dim() == 4:
+            if mask.size(1) != 1:
+                raise ValueError(
+                    "FlashInferBackend expects attention mask head dimension to be 1"
+                )
+            mask = mask[:, 0]
+        elif mask.dim() == 2:
+            mask = mask[:, None, :].expand(-1, q.size(1), -1)
+        elif mask.dim() != 3:
+            raise ValueError(
+                f"unsupported attention mask shape for FlashInfer: {tuple(mask.shape)}"
+            )
+
+        kv_lens = self._indptr_lens(kv_cache.kv_indptr)
+        max_q = max(q_lens, default=0)
+        max_kv = max(kv_lens, default=0)
+        if mask.size(0) < len(q_lens) or mask.size(1) < max_q or mask.size(2) < max_kv:
+            raise ValueError(
+                "attention mask is smaller than FlashInfer q/kv lengths: "
+                f"mask={tuple(mask.shape)}, q_lens={q_lens}, kv_lens={kv_lens}"
+            )
+        pieces = [
+            mask[i, : q_lens[i], : kv_lens[i]].reshape(-1) for i in range(len(q_lens))
+        ]
+        if not pieces:
+            return mask.new_empty((0,), dtype=torch.bool)
+        return torch.cat(pieces).contiguous()
+
+    @staticmethod
+    def _flatten_prefill_q(q: Tensor, q_lens: list[int]) -> Tensor:
+        if all(length == q.size(1) for length in q_lens):
+            return q.reshape(q.size(0) * q.size(1), q.size(2), q.size(3))
+        return torch.cat([q[i, : q_lens[i]] for i in range(len(q_lens))], dim=0)
+
+    @staticmethod
+    def _restore_prefill_output(out: Tensor, q: Tensor, q_lens: list[int]) -> Tensor:
+        if all(length == q.size(1) for length in q_lens):
+            return out.reshape(q.size(0), q.size(1), q.size(2), q.size(3))
+        restored = q.new_zeros((q.size(0), q.size(1), q.size(2), q.size(3)))
+        offset = 0
+        for i, length in enumerate(q_lens):
+            restored[i, :length] = out[offset : offset + length]
+            offset += length
+        return restored
+
+    def _plan_decode(self, q: Tensor, k: Tensor, kv_cache: "KVCache") -> None:
+        assert kv_cache.kv_indptr is not None
+        batch = q.size(0)
+        signature = (
+            q.size(2),
+            k.size(2),
+            q.size(3),
+            q.dtype,
+            kv_cache.k_buffer.dtype,
+            kv_cache.max_len,
+            kv_cache.req_pool_indices.data_ptr(),
+            kv_cache.seq_lens.data_ptr(),
+            kv_cache.kv_indptr.data_ptr(),
+        )
+        if (
+            self._last_decode_cache is kv_cache
+            and self._last_decode_signature == signature
+        ):
+            return
+
+        indptr = self._as_int32(kv_cache.kv_indptr)
+        indices = self._paged_indices(kv_cache)
+        last_page_len = self._get_ones_cpu(batch)
+        seq_lens = self._as_int32(kv_cache.seq_lens)
+
+        assert self.decode_wrapper is not None
+        self.decode_wrapper.plan(
+            indptr=indptr,
+            indices=indices,
+            last_page_len=last_page_len,
+            num_qo_heads=q.size(2),
+            num_kv_heads=k.size(2),
+            head_dim=q.size(3),
+            page_size=self._PAGE_SIZE,
+            pos_encoding_mode="NONE",
+            seq_lens=seq_lens,
+            data_type=kv_cache.k_buffer.dtype,
+            q_data_type=q.dtype,
+            kv_data_type=kv_cache.k_buffer.dtype,
+            non_blocking=True,
+        )
+        self._last_decode_cache = kv_cache
+        self._last_decode_signature = signature
+        self._last_decode_tensors = (indptr, indices, last_page_len, seq_lens)
+
+    def _plan_prefill(
+        self,
+        q: Tensor,
+        k: Tensor,
+        kv_cache: "KVCache",
+        attn_mask: Optional[Tensor],
+        is_causal: bool,
+        q_lens: list[int],
+    ) -> None:
+        assert kv_cache.kv_indptr is not None and kv_cache.qo_indptr is not None
+        mask_signature = (
+            (attn_mask.data_ptr(), tuple(attn_mask.shape), attn_mask.dtype)
+            if attn_mask is not None
+            else None
+        )
+        signature = (
+            q.size(2),
+            k.size(2),
+            q.size(3),
+            q.dtype,
+            kv_cache.k_buffer.dtype,
+            kv_cache.max_len,
+            bool(is_causal and attn_mask is None),
+            kv_cache.req_pool_indices.data_ptr(),
+            kv_cache.seq_lens.data_ptr(),
+            kv_cache.kv_indptr.data_ptr(),
+            kv_cache.qo_indptr.data_ptr(),
+            mask_signature,
+        )
+        if (
+            self._last_prefill_cache is kv_cache
+            and self._last_prefill_signature == signature
+        ):
+            return
+
+        custom_mask = (
+            self._flatten_custom_mask(attn_mask, q, kv_cache, q_lens)
+            if attn_mask is not None
+            else None
+        )
+
+        qo_indptr = self._as_int32(kv_cache.qo_indptr)
+        kv_indptr = self._as_int32(kv_cache.kv_indptr)
+        indices = self._paged_indices(kv_cache)
+        last_page_len = self._get_ones_cpu(q.size(0))
+        seq_lens = self._as_int32(kv_cache.seq_lens)
+
+        assert self.prefill_wrapper is not None
+        self.prefill_wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=kv_indptr,
+            paged_kv_indices=indices,
+            paged_kv_last_page_len=last_page_len,
+            num_qo_heads=q.size(2),
+            num_kv_heads=k.size(2),
+            head_dim_qk=q.size(3),
+            page_size=self._PAGE_SIZE,
+            custom_mask=custom_mask,
+            causal=bool(is_causal and custom_mask is None),
+            pos_encoding_mode="NONE",
+            seq_lens=seq_lens,
+            q_data_type=q.dtype,
+            kv_data_type=kv_cache.k_buffer.dtype,
+            non_blocking=True,
+        )
+        self._last_prefill_cache = kv_cache
+        self._last_prefill_signature = signature
+        tensors = [qo_indptr, kv_indptr, indices, last_page_len, seq_lens]
+        if custom_mask is not None:
+            tensors.append(custom_mask)
+        self._last_prefill_tensors = tuple(tensors)
 
 
 @AttentionBackendFactory.register(ATTN_BACKEND.FLASH.value)

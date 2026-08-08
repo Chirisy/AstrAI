@@ -1455,7 +1455,7 @@ classDiagram
 | **Observer** | `TrainCallback`, callback implementations | Training process monitoring |
 | **Context** | `TrainContext` | Unified training state bag |
 | **Object Pool** | `Allocator`, `PagePool` | Page-based KV cache with LRU eviction |
-| **Strategy (Attention)** | `AttentionBackend`, `CudaBackend`, `FlashAttnBackend`, `TorchNativeBackend` | Attention computation backend switching via context manager |
+| **Strategy (Attention)** | `AttentionBackend`, `CudaBackend`, `FlashInferBackend`, `FlashAttnBackend`, `TorchNativeBackend` | Attention computation backend switching via context manager |
 | **Auto-dispatch (Rotary)** | `apply_rotary_emb`, `rotary_backend.py`, `rotary_ops.py` | Rotary embedding CUDA kernel auto-dispatch with torch fallback |
 | **Executor** | `BaseExecutor`, `NoneExecutor`, `DDPExecutor`, `FSDPExecutor` | Gradient accumulation & model distribution |
 | **Storage** | `Store`, `MmapStore`, `JsonlStore` | Format-agnostic data access with multi-segment support |
@@ -1468,7 +1468,7 @@ classDiagram
 2. **Training Flow**: `Trainer` → `TrainContextBuilder` → `TrainContext`, uses `BaseStrategy` for loss, `BaseExecutor` for gradient accumulation + model distribution
 3. **Strategy Selection**: `StrategyFactory` creates strategy by `train_type`
 4. **Executor Selection**: `ExecutorFactory.create(cfg.parallel_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
-5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. Attention backend selected via `attn_backend()` context manager (cuda > flash > torch priority; `ASTR_BACKEND` env var overrides default; `TorchNativeBackend` fallback). Rotary embedding auto-dispatches to CUDA kernel when available, else torch complex multiply.
+5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. Attention backend selected via `attn_backend()` context manager (cuda > flashinfer > flash > torch priority; `ASTR_BACKEND` env var overrides default; `TorchNativeBackend` fallback). Rotary embedding auto-dispatches to CUDA kernel when available, else torch complex multiply.
 6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` for multi-process DDP
 7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (`MmapStore`/`JsonlStore`) loads data with explicit `_length` and multi-segment `_data`
 8. **Checkpoint**: `Checkpoint` saves/loads safetensors + metadata; `CheckpointCallback` performs rank-0 training saves, with extra state saved as `{key}.pt`
