@@ -66,6 +66,15 @@ class TrainContext:
         )
 
 
+@dataclass
+class _PreloadedState:
+    model_config: dict = field(default_factory=dict)
+    state_dict: Optional[dict] = None
+    epoch: int = 0
+    consumed_samples: int = 0
+    checkpoint: Optional[Checkpoint] = None
+
+
 class TrainContextBuilder:
     def __init__(
         self,
@@ -81,112 +90,149 @@ class TrainContextBuilder:
         return self
 
     def build(self) -> TrainContext:
-        cfg = self.config
-        device = get_current_device()
+        # Resolve persisted state.
+        preloaded_state = self._load_preloaded_state()
 
-        executor = ExecutorFactory.create(
+        # Build the core training components and restore their persisted state.
+        executor = self._create_executor()
+        context = self._create_context(preloaded_state, executor)
+        self._prepare_model(context, executor, preloaded_state)
+        self._restore_optimizer_state(context)
+
+        # Resolve datasets.
+        train_dataset, val_dataset = self._get_datasets()
+        self._create_dataloaders(context, train_dataset, val_dataset)
+
+        # Strategies depend on the prepared model; online rollout depends on both.
+        strategy_kwargs = self._create_strategy(context, executor)
+        self._configure_rollout(context, strategy_kwargs)
+
+        return context
+
+    def _create_executor(self) -> BaseExecutor:
+        cfg = self.config
+        return ExecutorFactory.create(
             cfg.parallel_mode,
             grad_accum_steps=cfg.grad_accum_steps,
             **cfg.executor_kwargs,
         )
 
-        model_config = {}
+    def _load_preloaded_state(self) -> _PreloadedState:
+        cfg = self.config
+        state = _PreloadedState(
+            epoch=cfg.start_epoch,
+            consumed_samples=cfg.start_samples * get_world_size(),
+        )
         if self._param_path:
             config_path = Path(self._param_path) / "config.json"
             if config_path.exists():
-                model_config = load_json(config_path)
-
-        preloaded_state_dict = None
-        preloaded_epoch = cfg.start_epoch
-        preloaded_consumed = cfg.start_samples * get_world_size()
-        preloaded_checkpoint = None
-        if self._param_path:
+                state.model_config = load_json(config_path)
             checkpoint = Checkpoint.load_any(self._param_path)
             if checkpoint is not None:
-                preloaded_state_dict = checkpoint.state_dict
-                if checkpoint.config:
-                    model_config = checkpoint.config
+                state.state_dict = checkpoint.state_dict
+                state.model_config = checkpoint.config or state.model_config
                 if self._resume:
-                    preloaded_epoch = checkpoint.epoch
+                    state.epoch = checkpoint.epoch
                     per_step = (
                         cfg.batch_per_device * get_world_size() * cfg.grad_accum_steps
                     )
-                    preloaded_consumed = (
-                        checkpoint.consumed_samples // per_step
-                    ) * per_step
-                    preloaded_checkpoint = checkpoint
+                    state.consumed_samples = (
+                        checkpoint.consumed_samples // per_step * per_step
+                    )
+                    state.checkpoint = checkpoint
+        if not state.model_config and hasattr(cfg.model_fn(), "config"):
+            state.model_config = cfg.model_fn().config.to_dict()
+        return state
 
-        if not model_config and hasattr(cfg.model_fn(), "config"):
-            model_config = cfg.model_fn().config.to_dict()
+    def _create_context(
+        self, state: _PreloadedState, executor: BaseExecutor
+    ) -> TrainContext:
+        return TrainContext(
+            world_size=get_world_size(),
+            rank=get_rank(),
+            config=self.config,
+            model_config=state.model_config,
+            executor=executor,
+            epoch=state.epoch,
+            consumed_samples=state.consumed_samples,
+            checkpoint=state.checkpoint,
+        )
 
-        def _before_wrap(m):
-            m = m.to(device=device)
+    def _prepare_model(
+        self, context: TrainContext, executor: BaseExecutor, state: _PreloadedState
+    ) -> None:
+        cfg = self.config
+        device = get_current_device()
+
+        def before_wrap(model):
+            model = model.to(device=device)
             if cfg.lora is not None:
                 inject_lora(
-                    m,
+                    model,
                     r=cfg.lora.r,
                     alpha=cfg.lora.alpha,
                     target_modules=set(cfg.lora.target_modules),
                 )
-            if preloaded_state_dict is not None:
-                m.load_state_dict(preloaded_state_dict, strict=False)
-            return m
+            if state.state_dict is not None:
+                model.load_state_dict(state.state_dict, strict=False)
+            return model
 
-        def _after_wrap(m):
+        def after_wrap(model):
             if cfg.compile_mode is not None:
                 logger.info("torch.compile enabled (mode=%s)", cfg.compile_mode)
-                m = torch.compile(m, mode=cfg.compile_mode)
-            return m
-
-        context = TrainContext(
-            world_size=get_world_size(),
-            rank=get_rank(),
-            config=cfg,
-            model_config=model_config,
-            executor=executor,
-            epoch=preloaded_epoch,
-            consumed_samples=preloaded_consumed,
-            checkpoint=preloaded_checkpoint,
-        )
+                model = torch.compile(model, mode=cfg.compile_mode)
+            return model
 
         context.model, context.optimizer, context.scheduler = executor.prepare(
             cfg.model_fn,
             cfg.optimizer_fn,
             cfg.scheduler_fn,
-            before_wrap=_before_wrap,
-            after_wrap=_after_wrap,
+            before_wrap=before_wrap,
+            after_wrap=after_wrap,
         )
 
-        train_dataset = cfg.dataset
-        val_dataset = cfg.val_dataset
+    def _get_datasets(self):
+        cfg = self.config
+        if cfg.val_dataset is not None or cfg.val_split is None:
+            return cfg.dataset, cfg.val_dataset
+        n_val = max(1, int(len(cfg.dataset) * cfg.val_split))
+        generator = torch.Generator().manual_seed(cfg.random_seed)
+        return random_split(
+            cfg.dataset, [len(cfg.dataset) - n_val, n_val], generator=generator
+        )
 
-        if val_dataset is None and cfg.val_split is not None:
-            n_total = len(cfg.dataset)
-            n_val = max(1, int(n_total * cfg.val_split))
-            n_train = n_total - n_val
-            generator = torch.Generator().manual_seed(cfg.random_seed)
-            train_dataset, val_dataset = random_split(
-                cfg.dataset, [n_train, n_val], generator=generator
+    def _create_dataloaders(
+        self, context: TrainContext, train_dataset, val_dataset
+    ) -> None:
+        cfg = self.config
+        sampler_offset = context.consumed_samples // context.world_size
+        if self._resume and sampler_offset > 0:
+            samples_per_replica = (
+                len(train_dataset) + context.world_size - 1
+            ) // context.world_size
+            if samples_per_replica > 0:
+                context.epoch = sampler_offset // samples_per_replica
+        context.dataloader = self._create_dataloader(
+            train_dataset, context.epoch, sampler_offset
+        )
+        if val_dataset is not None:
+            context.val_dataloader = self._create_dataloader(
+                val_dataset, 0, 0, shuffle=False
             )
 
-        sampler_offset = context.consumed_samples // context.world_size
-
-        if self._resume and sampler_offset > 0:
-            offset = context.world_size - 1
-            num_samples_per_replica = (
-                len(train_dataset) + offset
-            ) // context.world_size
-            if num_samples_per_replica > 0:
-                context.epoch = sampler_offset // num_samples_per_replica
-
+    def _create_dataloader(
+        self, dataset, epoch: int, start_iter: int, shuffle: bool = True
+    ):
+        cfg = self.config
         sampler = RDSampler(
-            data_source=train_dataset,
-            start_epoch=context.epoch,
-            start_iter=sampler_offset,
+            dataset,
+            start_epoch=epoch,
+            start_iter=start_iter,
             seed=cfg.random_seed,
+            shuffle=shuffle,
         )
-        context.dataloader = DataLoader(
-            train_dataset,
+        return DataLoader(
+            dataset,
             batch_size=cfg.batch_per_device,
             sampler=sampler,
             num_workers=cfg.num_workers,
@@ -195,99 +241,73 @@ class TrainContextBuilder:
             collate_fn=cfg.collate_fn,
         )
 
-        if val_dataset is not None:
-            val_sampler = RDSampler(
-                data_source=val_dataset,
-                start_epoch=0,
-                start_iter=0,
-                seed=cfg.random_seed,
-                shuffle=False,
-            )
-            context.val_dataloader = DataLoader(
-                val_dataset,
-                batch_size=cfg.batch_per_device,
-                sampler=val_sampler,
-                num_workers=cfg.num_workers,
-                pin_memory=cfg.pin_memory,
-                prefetch_factor=cfg.prefetch_factor,
-                collate_fn=cfg.collate_fn,
-            )
-
+    def _restore_optimizer_state(self, context: TrainContext) -> None:
         if context.checkpoint and context.checkpoint.extra:
-            extra = context.checkpoint.extra
             for name in ("optimizer", "scheduler"):
-                if name in extra:
-                    obj = getattr(context, name, None)
-                    if obj is not None:
-                        obj.load_state_dict(extra[name])
+                if (
+                    name in context.checkpoint.extra
+                    and getattr(context, name, None) is not None
+                ):
+                    getattr(context, name).load_state_dict(
+                        context.checkpoint.extra[name]
+                    )
 
-        strategy_kwargs = dict(cfg.extra_kwargs)
-        strategy_kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
-
-        needs_ref = cfg.strategy in (
-            "dpo",
-            "grpo",
-            "online_grpo",
-            "online_dpo",
-        )
-        needs_old = cfg.strategy in ("grpo", "online_grpo")
-
-        if needs_ref:
-            strategy_kwargs["ref_model"] = create_ref_model(
-                cfg.model_fn, executor=executor, model=context.model, device=device
+    def _create_strategy(self, context: TrainContext, executor: BaseExecutor) -> dict:
+        cfg = self.config
+        kwargs = dict(cfg.extra_kwargs)
+        kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
+        if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo"):
+            kwargs["ref_model"] = create_ref_model(
+                cfg.model_fn,
+                executor=executor,
+                model=context.model,
+                device=get_current_device(),
             )
-
-        if needs_old:
-            strategy_kwargs["old_model"] = create_ref_model(
-                cfg.model_fn, executor=executor, model=context.model, device=device
+        if cfg.strategy in ("grpo", "online_grpo"):
+            kwargs["old_model"] = create_ref_model(
+                cfg.model_fn,
+                executor=executor,
+                model=context.model,
+                device=get_current_device(),
             )
-
         context.strategy = StrategyFactory.create(
             cfg.strategy,
             model=context.model,
-            device=device,
+            device=get_current_device(),
             executor=executor,
-            **strategy_kwargs,
+            **kwargs,
         )
+        return kwargs
 
-        # Enable online rollout when the train_type is an ``online_*`` variant.
-        is_online = cfg.strategy.startswith("online_")
-        if is_online:
-            if not context.strategy.supports_online():
-                raise ValueError(
-                    f"Strategy '{cfg.strategy}' does not support online rollout"
-                )
-            if cfg.reward_model_fn is None:
-                raise ValueError("reward_model_fn is required for online RL strategies")
-
-            tokenizer = AutoTokenizer.from_pretrained(self._param_path)
-            reward_model = cfg.reward_model_fn()
-
-            group_size = strategy_kwargs.get("group_size", 1)
-            rollout_batch_size = group_size * max(1, cfg.batch_per_device)
-            max_seq_len = getattr(context.model.config, "max_position_embeddings", None)
-
-            scheduler = InferenceScheduler(
-                model=context.model,
-                tokenizer=tokenizer,
-                max_batch_size=rollout_batch_size,
-                max_seq_len=max_seq_len,
+    def _configure_rollout(self, context: TrainContext, strategy_kwargs: dict) -> None:
+        cfg = self.config
+        if not cfg.strategy.startswith("online_"):
+            return
+        if not context.strategy.supports_online():
+            raise ValueError(
+                f"Strategy '{cfg.strategy}' does not support online rollout"
             )
-
-            generator = RolloutGenerator(
-                scheduler=scheduler,
-                tokenizer=tokenizer,
-                max_tokens=cfg.rollout_max_tokens,
-                group_size=group_size,
-                temperature=cfg.rollout_temperature,
-                top_k=cfg.rollout_top_k,
-                top_p=cfg.rollout_top_p,
-            )
-            runner = RolloutRunner(
+        tokenizer = AutoTokenizer.from_pretrained(self._param_path)
+        group_size = strategy_kwargs.get("group_size", 1)
+        scheduler = InferenceScheduler(
+            model=context.model,
+            tokenizer=tokenizer,
+            max_batch_size=group_size * max(1, cfg.batch_per_device),
+            max_seq_len=getattr(context.model.config, "max_position_embeddings", None),
+        )
+        generator = RolloutGenerator(
+            scheduler=scheduler,
+            tokenizer=tokenizer,
+            max_tokens=cfg.rollout_max_tokens,
+            group_size=group_size,
+            temperature=cfg.rollout_temperature,
+            top_k=cfg.rollout_top_k,
+            top_p=cfg.rollout_top_p,
+        )
+        context.strategy.set_rollout_runner(
+            RolloutRunner(
                 generator=generator,
-                reward_model=reward_model,
+                reward_model=cfg.reward_model_fn(),
                 rollout_interval=cfg.rollout_interval,
             )
-            context.strategy.set_rollout_runner(runner)
-
-        return context
+        )
